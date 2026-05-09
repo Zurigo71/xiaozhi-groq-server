@@ -8,9 +8,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: GROQ_API_KEY
-        sync: false   # Imposta nel dashboard Render
-      - key: TAVILY_API_KEY
-        sync: false   # Opzionale - lascia vuoto per usare DuckDuckGo gratis
-      - key: GROQ_MODEL
-        value: llama-3.1-8b-instant   # Puoi cambiare in: gemma2-9b-it, mixtral-8x7b-32768
+      - key: MCP_ENDPOINT
+        sync: false   # Incolla qui il tuo token WSS da xiaozhi.me
