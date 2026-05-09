@@ -5,200 +5,172 @@ import logging
 import requests
 from aiohttp import web
 import aiohttp
+import websockets
 from duckduckgo_search import DDGS
-import groq
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "")
 
-class XiaozhiGroqServer:
-    def __init__(self):
-        self.groq_client = groq.AsyncGroq(
-            api_key=os.getenv("GROQ_API_KEY", "")
-        )
-        self.model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-        self.tavily_api_key = os.getenv("TAVILY_API_KEY", "")
 
-        self.search_keywords = [
-            # Italiano
-            "cerca", "trova", "notizie", "ultime", "oggi", "recenti",
-            "informazioni su", "cosa è successo", "aggiornamento",
-            "meteo", "tempo", "temperatura", "previsioni",
-            "prezzo", "quotazione", "borsa", "bitcoin", "crypto",
-            "chi ha vinto", "risultato", "punteggio", "partita",
-            "quando è", "dove si trova", "quanto costa",
-            # Inglese
-            "search", "find", "news", "latest", "look up",
-            "weather", "price", "score", "who won",
-        ]
+def search_web(query: str) -> str:
+    """Cerca su DuckDuckGo e restituisce risultati compatti."""
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(query, max_results=4, region="it-it")
+            parts = [f"- {r.get('title','')}: {r.get('body','')[:300]}" for r in results]
+            return "\n".join(parts) if parts else "Nessun risultato trovato."
+    except Exception as e:
+        logger.error(f"Errore DuckDuckGo: {e}")
+        return f"Errore ricerca: {str(e)}"
 
-    # ------------------------------------------------------------------ #
-    #  RICERCA WEB                                                         #
-    # ------------------------------------------------------------------ #
 
-    def search_tavily(self, query: str) -> str:
-        try:
-            resp = requests.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": self.tavily_api_key,
-                    "query": query,
-                    "max_results": 3,
-                    "search_depth": "basic"
-                },
-                timeout=8
-            )
-            results = resp.json().get("results", [])
-            if not results:
-                return ""
-            parts = [f"- {r.get('title','')}: {r.get('content','')[:300]}" for r in results[:3]]
-            return "\n".join(parts)
-        except Exception as e:
-            logger.error(f"Errore Tavily: {e}")
-            return ""
+# ------------------------------------------------------------------ #
+#  MCP SERVER — espone il tool web_search a xiaozhi.me               #
+# ------------------------------------------------------------------ #
 
-    def search_duckduckgo(self, query: str) -> str:
-        try:
-            with DDGS() as ddgs:
-                results = ddgs.text(query, max_results=4, region="it-it")
-                parts = [f"- {r.get('title','')}: {r.get('body','')[:300]}" for r in results]
-                return "\n".join(parts)
-        except Exception as e:
-            logger.error(f"Errore DuckDuckGo: {e}")
-            return ""
+def handle_mcp_request(request_data: dict) -> dict:
+    """Gestisce le richieste MCP in arrivo da xiaozhi.me."""
+    method = request_data.get("method", "")
+    req_id = request_data.get("id")
 
-    def search_web(self, query: str) -> str:
-        if self.tavily_api_key:
-            logger.info("🔍 Ricerca via Tavily")
-            result = self.search_tavily(query)
-            if result:
-                return result
-            logger.warning("Tavily vuoto, fallback DuckDuckGo")
-        logger.info("🔍 Ricerca via DuckDuckGo")
-        return self.search_duckduckgo(query)
+    # Il modello vuole sapere quali tool sono disponibili
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "web_search",
+                        "description": (
+                            "Cerca informazioni aggiornate sul web. "
+                            "Usare per notizie, meteo, prezzi, eventi recenti, "
+                            "risultati sportivi e qualsiasi dato in tempo reale."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "La query di ricerca in italiano o inglese"
+                                }
+                            },
+                            "required": ["query"]
+                        }
+                    }
+                ]
+            }
+        }
 
-    # ------------------------------------------------------------------ #
-    #  LLM                                                                  #
-    # ------------------------------------------------------------------ #
+    # Il modello vuole eseguire una ricerca
+    elif method == "tools/call":
+        tool_name = request_data.get("params", {}).get("name", "")
+        arguments = request_data.get("params", {}).get("arguments", {})
 
-    async def ask_groq(self, user_text: str, web_context: str = "") -> str:
-        if web_context:
-            system_msg = (
-                "Sei un assistente AI per dispositivi IoT, rispondi in italiano. "
-                "Sii conciso (massimo 2-3 frasi brevi). "
-                "Usa i risultati web per rispondere in modo aggiornato.\n\n"
-                f"Risultati web:\n{web_context}"
-            )
+        if tool_name == "web_search":
+            query = arguments.get("query", "")
+            logger.info(f"🔍 Ricerca: {query}")
+            result = search_web(query)
+            logger.info(f"✅ Trovato: {result[:80]}...")
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": result}]
+                }
+            }
         else:
-            system_msg = (
-                "Sei un assistente AI per dispositivi IoT. "
-                "Rispondi in italiano. Sii conciso (massimo 2-3 frasi brevi)."
-            )
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Tool '{tool_name}' non trovato"}
+            }
+
+    # Inizializzazione MCP
+    elif method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "xiaozhi-websearch", "version": "1.0.0"}
+            }
+        }
+
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Metodo '{method}' non supportato"}
+        }
+
+
+async def mcp_bridge():
+    """
+    Si connette all'endpoint MCP di xiaozhi.me via WebSocket
+    e risponde alle chiamate del modello LLM.
+    """
+    if not MCP_ENDPOINT:
+        logger.warning("⚠️  MCP_ENDPOINT non configurato, bridge disabilitato.")
+        return
+
+    while True:
         try:
-            response = await self.groq_client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_text}
-                ],
-                max_tokens=300,
-                temperature=0.6
-            )
-            return response.choices[0].message.content
+            logger.info(f"🔌 Connessione a xiaozhi.me MCP endpoint...")
+            async with websockets.connect(MCP_ENDPOINT) as ws:
+                logger.info("✅ Connesso all'MCP endpoint!")
+
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        logger.info(f"📨 MCP request: {data.get('method','?')} (id={data.get('id')})")
+                        response = handle_mcp_request(data)
+                        await ws.send(json.dumps(response))
+                    except Exception as e:
+                        logger.error(f"Errore gestione messaggio: {e}")
+
         except Exception as e:
-            logger.error(f"Errore Groq: {e}")
-            return "Mi dispiace, non riesco a rispondere in questo momento."
+            logger.error(f"❌ Connessione MCP persa: {e}. Riprovo tra 5s...")
+            await asyncio.sleep(5)
 
-    def needs_search(self, text: str) -> bool:
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in self.search_keywords)
 
-    # ------------------------------------------------------------------ #
-    #  WEBSOCKET HANDLER (aiohttp)                                         #
-    # ------------------------------------------------------------------ #
+# ------------------------------------------------------------------ #
+#  HTTP — health check per Render                                     #
+# ------------------------------------------------------------------ #
 
-    async def websocket_handler(self, request):
-        """Gestisce connessioni WebSocket da Xiaozhi."""
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        client_ip = request.remote
-        logger.info(f"📱 Client connesso: {client_ip}")
-
-        async for msg in ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    msg_type = data.get("type", "")
-                    text = data.get("text", "")
-
-                    if msg_type == "ping":
-                        await ws.send_json({"type": "pong"})
-                        continue
-
-                    if not text:
-                        continue
-
-                    logger.info(f"🎤 Ricevuto: {text[:80]}")
-
-                    if self.needs_search(text):
-                        logger.info("🔍 Ricerca web attivata")
-                        web_results = await asyncio.to_thread(self.search_web, text)
-                        answer = await self.ask_groq(text, web_results)
-                    else:
-                        logger.info("💬 Risposta diretta LLM")
-                        answer = await self.ask_groq(text)
-
-                    await ws.send_json({
-                        "type": "tts",
-                        "text": answer,
-                        "session_id": data.get("session_id", "")
-                    })
-                    logger.info(f"✅ Risposta: {answer[:80]}")
-
-                except json.JSONDecodeError:
-                    await ws.send_json({"type": "error", "text": "Formato non valido"})
-
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                logger.error(f"WebSocket error: {ws.exception()}")
-
-        logger.info(f"❌ Client disconnesso: {client_ip}")
-        return ws
-
-    # ------------------------------------------------------------------ #
-    #  HTTP HEALTH CHECK — risponde ai HEAD/GET di Render                  #
-    # ------------------------------------------------------------------ #
-
-    async def health_handler(self, request):
-        return web.Response(
-            text=json.dumps({
-                "status": "ok",
-                "model": self.model,
-                "tavily": bool(self.tavily_api_key)
-            }),
-            content_type="application/json"
-        )
+async def health_handler(request):
+    return web.Response(
+        text=json.dumps({
+            "status": "ok",
+            "mcp_endpoint": bool(MCP_ENDPOINT),
+            "bridge": "running"
+        }),
+        content_type="application/json"
+    )
 
 
 async def main():
-    server = XiaozhiGroqServer()
     port = int(os.getenv("PORT", 8000))
 
+    # Avvia il bridge MCP in background
+    asyncio.create_task(mcp_bridge())
+
+    # Avvia HTTP server per health check Render
     app = web.Application()
-    app.router.add_get("/", server.health_handler)       # health check Render
-    app.router.add_get("/health", server.health_handler)
-    app.router.add_get("/ws", server.websocket_handler)  # WebSocket Xiaozhi
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
 
     logger.info(f"🚀 Server avviato su porta {port}")
-    logger.info(f"   Modello: {server.model}")
-    logger.info(f"   Tavily: {'✅' if server.tavily_api_key else '⚠️  DuckDuckGo'}")
+    logger.info(f"   MCP Endpoint: {'✅ configurato' if MCP_ENDPOINT else '⚠️  non configurato'}")
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    await asyncio.Future()  # resta in ascolto
+    await asyncio.Future()
 
 
 if __name__ == "__main__":
