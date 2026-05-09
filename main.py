@@ -3,7 +3,7 @@ import websockets
 import json
 import os
 import logging
-from duckduckgo_search import AsyncDDGS
+from duckduckgo_search import DDGS
 import groq
 
 logging.basicConfig(level=logging.INFO)
@@ -11,29 +11,26 @@ logger = logging.getLogger(__name__)
 
 class XiaozhiGroqServer:
     def __init__(self):
-        self.ddgs = AsyncDDGS()
         self.groq_client = groq.AsyncGroq(
-            api_key=os.getenv("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", "")
+            api_key=os.getenv("GROQ_API_KEY", "")
         )
-        # Modello leggero e veloce su Groq
         self.model = "llama-3.2-3b-preview"
-        
-        # Parole chiave che attivano la ricerca web
         self.search_keywords = [
             "cerca", "trova", "notizie", "ultime", "oggi", "recenti",
             "search", "find", "news", "latest", "look up", "informazioni su"
         ]
     
-    async def search_web(self, query: str) -> str:
-        """Cerca su DuckDuckGo e formatta i risultati."""
+    def search_web(self, query: str) -> str:
+        """Cerca su DuckDuckGo e formatta i risultati (sincrono)."""
         try:
-            results = await self.ddgs.text(query, max_results=5, region="it-it")
-            formatted = []
-            for i, r in enumerate(results, 1):
-                title = r.get('title', 'N/A')
-                body = r.get('body', '')[:250]
-                formatted.append(f"[{i}] {title}: {body}")
-            return "\n".join(formatted)
+            with DDGS() as ddgs:
+                results = ddgs.text(query, max_results=5, region="it-it")
+                formatted = []
+                for i, r in enumerate(results, 1):
+                    title = r.get('title', 'N/A')
+                    body = r.get('body', '')[:250]
+                    formatted.append(f"[{i}] {title}: {body}")
+                return "\n".join(formatted)
         except Exception as e:
             logger.error(f"Errore ricerca web: {e}")
             return ""
@@ -92,7 +89,8 @@ class XiaozhiGroqServer:
                     # Decidi se cercare sul web
                     if self.needs_search(text):
                         logger.info("🔍 Ricerca web attivata")
-                        web_results = await self.search_web(text)
+                        # Esegui ricerca in thread separato (non async)
+                        web_results = await asyncio.to_thread(self.search_web, text)
                         answer = await self.ask_groq(text, web_results)
                     else:
                         logger.info("💬 Risposta diretta LLM")
@@ -115,8 +113,6 @@ class XiaozhiGroqServer:
                     
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"❌ Client disconnesso: {client_ip}")
-        except Exception as e:
-            logger.error(f"Errore: {e}")
 
 async def main():
     server = XiaozhiGroqServer()
