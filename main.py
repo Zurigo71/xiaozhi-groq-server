@@ -113,6 +113,13 @@ def handle_mcp_request(request_data: dict) -> dict:
             }
         }
 
+    elif method == "ping":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {}
+        }
+
     elif method == "notifications/initialized":
         # Notifica, non richiede risposta
         return None
@@ -134,7 +141,7 @@ async def mcp_bridge():
     while True:
         try:
             logger.info("🔌 Connessione a xiaozhi.me MCP endpoint...")
-            async with websockets.connect(MCP_ENDPOINT) as ws:
+            async with websockets.connect(MCP_ENDPOINT, ping_interval=20, ping_timeout=30) as ws:
                 logger.info("✅ Connesso all'MCP endpoint!")
                 async for message in ws:
                     try:
