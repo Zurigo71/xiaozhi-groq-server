@@ -6,7 +6,12 @@ import requests
 from aiohttp import web
 import aiohttp
 import websockets
-from duckduckgo_search import DDGS
+
+# Supporta sia il nuovo pacchetto ddgs che il vecchio duckduckgo_search
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,9 +21,11 @@ MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "")
 
 def search_web(query: str) -> str:
     """Cerca su DuckDuckGo e restituisce risultati compatti."""
+    if not query or not query.strip():
+        return "Query di ricerca vuota."
     try:
         with DDGS() as ddgs:
-            results = ddgs.text(query, max_results=4, region="it-it")
+            results = ddgs.text(query.strip(), max_results=4, region="it-it")
             parts = [f"- {r.get('title','')}: {r.get('body','')[:300]}" for r in results]
             return "\n".join(parts) if parts else "Nessun risultato trovato."
     except Exception as e:
@@ -27,15 +34,13 @@ def search_web(query: str) -> str:
 
 
 # ------------------------------------------------------------------ #
-#  MCP SERVER — espone il tool web_search a xiaozhi.me               #
+#  MCP SERVER                                                          #
 # ------------------------------------------------------------------ #
 
 def handle_mcp_request(request_data: dict) -> dict:
-    """Gestisce le richieste MCP in arrivo da xiaozhi.me."""
     method = request_data.get("method", "")
     req_id = request_data.get("id")
 
-    # Il modello vuole sapere quali tool sono disponibili
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
@@ -64,16 +69,25 @@ def handle_mcp_request(request_data: dict) -> dict:
             }
         }
 
-    # Il modello vuole eseguire una ricerca
     elif method == "tools/call":
         tool_name = request_data.get("params", {}).get("name", "")
-        arguments = request_data.get("params", {}).get("arguments", {})
+        # Qwen3 può mandare gli argomenti in "arguments" o "input"
+        params = request_data.get("params", {})
+        arguments = params.get("arguments") or params.get("input") or params.get("parameters") or {}
+
+        # Log completo per debug
+        logger.info(f"📦 params completi: {json.dumps(params)}")
 
         if tool_name == "web_search":
-            query = arguments.get("query", "")
-            logger.info(f"🔍 Ricerca: {query}")
-            result = search_web(query)
-            logger.info(f"✅ Trovato: {result[:80]}...")
+            query = arguments.get("query", "").strip()
+            logger.info(f"🔍 Ricerca: '{query}'")
+
+            if not query:
+                result = "Nessuna query ricevuta."
+            else:
+                result = search_web(query)
+
+            logger.info(f"✅ Trovato: {result[:100]}...")
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -88,7 +102,6 @@ def handle_mcp_request(request_data: dict) -> dict:
                 "error": {"code": -32601, "message": f"Tool '{tool_name}' non trovato"}
             }
 
-    # Inizializzazione MCP
     elif method == "initialize":
         return {
             "jsonrpc": "2.0",
@@ -100,7 +113,12 @@ def handle_mcp_request(request_data: dict) -> dict:
             }
         }
 
+    elif method == "notifications/initialized":
+        # Notifica, non richiede risposta
+        return None
+
     else:
+        logger.warning(f"Metodo sconosciuto: {method} — dati: {json.dumps(request_data)}")
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -109,56 +127,40 @@ def handle_mcp_request(request_data: dict) -> dict:
 
 
 async def mcp_bridge():
-    """
-    Si connette all'endpoint MCP di xiaozhi.me via WebSocket
-    e risponde alle chiamate del modello LLM.
-    """
     if not MCP_ENDPOINT:
-        logger.warning("⚠️  MCP_ENDPOINT non configurato, bridge disabilitato.")
+        logger.warning("⚠️  MCP_ENDPOINT non configurato.")
         return
 
     while True:
         try:
-            logger.info(f"🔌 Connessione a xiaozhi.me MCP endpoint...")
+            logger.info("🔌 Connessione a xiaozhi.me MCP endpoint...")
             async with websockets.connect(MCP_ENDPOINT) as ws:
                 logger.info("✅ Connesso all'MCP endpoint!")
-
                 async for message in ws:
                     try:
                         data = json.loads(message)
                         logger.info(f"📨 MCP request: {data.get('method','?')} (id={data.get('id')})")
                         response = handle_mcp_request(data)
-                        await ws.send(json.dumps(response))
+                        if response is not None:
+                            await ws.send(json.dumps(response))
                     except Exception as e:
                         logger.error(f"Errore gestione messaggio: {e}")
-
         except Exception as e:
             logger.error(f"❌ Connessione MCP persa: {e}. Riprovo tra 5s...")
             await asyncio.sleep(5)
 
 
-# ------------------------------------------------------------------ #
-#  HTTP — health check per Render                                     #
-# ------------------------------------------------------------------ #
-
 async def health_handler(request):
     return web.Response(
-        text=json.dumps({
-            "status": "ok",
-            "mcp_endpoint": bool(MCP_ENDPOINT),
-            "bridge": "running"
-        }),
+        text=json.dumps({"status": "ok", "mcp_endpoint": bool(MCP_ENDPOINT)}),
         content_type="application/json"
     )
 
 
 async def main():
     port = int(os.getenv("PORT", 8000))
-
-    # Avvia il bridge MCP in background
     asyncio.create_task(mcp_bridge())
 
-    # Avvia HTTP server per health check Render
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
